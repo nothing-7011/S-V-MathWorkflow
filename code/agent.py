@@ -27,20 +27,21 @@ from pickle import FALSE
 import sys
 import json
 from textwrap import indent
-import requests
 import argparse
 import logging
+from google import genai
+from google.genai import types
 
 # --- CONFIGURATION ---
-# The model to use. "gemini-1.5-flash" is fast and capable.
-#MODEL_NAME = "gemini-1.5-flash-latest" 
-MODEL_NAME = "gemini-2.5-pro" 
-# Use the Generative Language API endpoint, which is simpler for API key auth
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+# Default configuration
+DEFAULT_MODEL_NAME = "gemini-2.5-pro"
+DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com"
 
-# Global variables for logging
+# Global variables
 _log_file = None
 original_print = print
+client = None
+MODEL_NAME = DEFAULT_MODEL_NAME
 
 def log_print(*args, **kwargs):
     """
@@ -261,8 +262,9 @@ def read_file_content(filepath):
 
 def build_request_payload(system_prompt, question_prompt, other_prompts=None):
     """
-    Builds the JSON payload for the Gemini API request, using the
-    recommended multi-turn format to include a system prompt.
+    Builds the dictionary payload for the request.
+    This structure is maintained for compatibility with the agent logic,
+    but it will be converted to SDK arguments in send_api_request.
     """
     payload = {
         "systemInstruction": {
@@ -297,39 +299,86 @@ def build_request_payload(system_prompt, question_prompt, other_prompts=None):
 
 def send_api_request(api_key, payload):
     """
-    Sends the request to the Gemini API and returns the response.
+    Sends the request to the Gemini API using the google-genai SDK.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": api_key # API key now in header!
-    }
+    if client is None:
+        raise ValueError("Client not initialized. Please call init_client first.")
+
+    # Extract configuration and content from the payload dict
+    system_instruction = None
+    if "systemInstruction" in payload and "parts" in payload["systemInstruction"]:
+        system_instruction = payload["systemInstruction"]["parts"][0]["text"]
+
+    contents = payload.get("contents", [])
     
-    #print("Sending request to Gemini API...")
+    # Convert config
+    config_dict = payload.get("generationConfig", {})
+
+    # Handle thinkingConfig safety
+    if "thinkingConfig" in config_dict:
+        # If the model is not a pro model (which usually supports thinking),
+        # or if we want to be safe for models like flash-preview that might not support it,
+        # we might need to remove it or handle errors.
+        # For now, we'll try to use it, but catch 400 errors specifically related to config.
+        pass
+
     try:
-        response = requests.post(API_URL, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
-        return response.json()
-    except requests.exceptions.RequestException as e:
+        # We need to pass the configuration as a GenerateContentConfig object or dict
+        # The SDK accepts dicts for config.
+
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=config_dict.get("temperature"),
+                top_p=config_dict.get("topP"),
+                thinking_config=config_dict.get("thinkingConfig")
+            )
+        )
+
+        # Return a structure compatible with extract_text_from_response
+        # or simplify extract_text_from_response to take the response object.
+        # Here we return the SDK response object, and update extract_text_from_response.
+        return response
+
+    except Exception as e:
         print(f"Error during API request: {e}")
-        if response.status_code == 400:
-            print(f"Possible reason for 400: Model '{MODEL_NAME}' might not be available or URL is incorrect for your setup.")
-            print(f"Raw API Response (if available): {response.text}")
-        #sys.exit(1)
+        # If it was a config error (e.g. thinkingConfig not supported), we could retry without it?
+        if "thinkingConfig" in config_dict and ("INVALID_ARGUMENT" in str(e) or "400" in str(e)):
+            print("Retrying without thinkingConfig...")
+            try:
+                del config_dict["thinkingConfig"]
+                response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=config_dict.get("temperature"),
+                        top_p=config_dict.get("topP")
+                    )
+                )
+                return response
+            except Exception as retry_e:
+                print(f"Retry failed: {retry_e}")
+                raise retry_e
         raise e
 
 def extract_text_from_response(response_data):
     """
-    Extracts the generated text from the API response JSON.
-    Handles potential errors if the response format is unexpected.
+    Extracts the generated text from the API response.
+    Handles both SDK response objects and dicts (if fallback needed).
     """
     try:
+        if hasattr(response_data, 'text'):
+            return response_data.text
+        # Fallback for dict (legacy)
         return response_data['candidates'][0]['content']['parts'][0]['text']
-    except (KeyError, IndexError, TypeError) as e:
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as e:
         print("Error: Could not extract text from the API response.")
         print(f"Reason: {e}")
-        print("Full API Response:")
-        print(json.dumps(response_data, indent=2))
-        #sys.exit(1)
+        # print("Full API Response:")
+        # print(response_data)
         raise e 
 
 def extract_detailed_solution(solution, marker='Detailed Solution', after=True):
@@ -370,53 +419,36 @@ def verify_solution(problem_statement, solution, verbose=True):
         )
     
     if(verbose):
-        print(">>>>>>> Verification prompt:")
-        print(json.dumps(p2, indent=4))
+        #print(">>>>>>> Verification prompt:")
+        #print(json.dumps(p2, indent=4))
+        pass
 
-    res = send_api_request(get_api_key(), p2)
+    # Note: send_api_request now returns response object, but we pass api_key=None as we use global client
+    res = send_api_request(None, p2)
     out = extract_text_from_response(res) 
 
     if(verbose):
         print(">>>>>>> Verification results:")
-        print(json.dumps(out, indent=4))
+        print(out)
 
     check_correctness = """Response in "yes" or "no". Is the following statement saying the solution is correct, or does not contain critical error or a major justification gap?""" \
             + "\n\n" + out 
     prompt = build_request_payload(system_prompt="", question_prompt=check_correctness)
-    r = send_api_request(get_api_key(), prompt)
+    r = send_api_request(None, prompt)
     o = extract_text_from_response(r) 
 
     if(verbose):
         print(">>>>>>> Is verification good?")
-        print(json.dumps(o, indent=4))
+        print(o)
         
     bug_report = ""
 
     if("yes" not in o.lower()):
         bug_report = extract_detailed_solution(out, "Detailed Verification", False)
 
-        """p2["contents"].append(
-            {"role": "model",
-            "parts": [{"text": bug_report}]
-            }
-        )
-        p2["contents"].append(
-            {"role": "user",
-            "parts": [{"text": check_verification_prompt}]
-            }
-        )
-
-        if(verbose):
-            print(">>>>>>> Review bug report prompt:")
-            print(json.dumps(p2["contents"][-2:], indent=4))
-
-        res = send_api_request(get_api_key(), p2)
-        out = extract_text_from_response(res) 
-    """
-
     if(verbose):
         print(">>>>>>>Bug report:")
-        print(json.dumps(bug_report, indent=4))
+        print(bug_report)
     
     return bug_report, o
 
@@ -433,7 +465,7 @@ Response in exactly "yes" or "no". No other words.
     """
 
     p1 = build_request_payload(system_prompt="",    question_prompt=check_complete_prompt)
-    r = send_api_request(get_api_key(), p1)
+    r = send_api_request(None, p1)
     o = extract_text_from_response(r)
 
     print(o)
@@ -450,13 +482,13 @@ def init_explorations(problem_statement, verbose=True, other_prompts=[]):
         )
 
     print(f">>>>>> Initial prompt.")
-    print(json.dumps(p1, indent=4))
+    #print(json.dumps(p1, indent=4))
 
-    response1 = send_api_request(get_api_key(), p1)
+    response1 = send_api_request(None, p1)
     output1 = extract_text_from_response(response1)
 
     print(f">>>>>>> First solution: ") 
-    print(json.dumps(output1, indent=4))
+    print(output1)
 
     print(f">>>>>>> Self improvement start:")
     p1["contents"].append(
@@ -470,10 +502,10 @@ def init_explorations(problem_statement, verbose=True, other_prompts=[]):
         }
     )
 
-    response2 = send_api_request(get_api_key(), p1)
+    response2 = send_api_request(None, p1)
     solution = extract_text_from_response(response2)
     print(f">>>>>>> Corrected solution: ")
-    print(json.dumps(solution, indent=4))
+    print(solution)
     
     #print(f">>>>>>> Check if solution is complete:"  )
     #is_complete = check_if_solution_claimed_complete(output1)
@@ -485,7 +517,7 @@ def init_explorations(problem_statement, verbose=True, other_prompts=[]):
     verify, good_verify = verify_solution(problem_statement, solution, verbose)
 
     print(f">>>>>>> Initial verification: ")
-    print(json.dumps(verify, indent=4))
+    print(verify)
     print(f">>>>>>> verify results: {good_verify}")
     
     return p1, solution, verify, good_verify
@@ -556,13 +588,13 @@ def agent(problem_statement, other_prompts=[], memory_file=None, resume_from_mem
                 }
             )
 
-            print(">>>>>>> New prompt:")
-            print(json.dumps(p1, indent=4))
-            response2 = send_api_request(get_api_key(), p1)
+            print(">>>>>>> New prompt.")
+            #print(json.dumps(p1, indent=4))
+            response2 = send_api_request(None, p1)
             solution = extract_text_from_response(response2)
 
             print(">>>>>>> Corrected solution:")
-            print(json.dumps(solution, indent=4))
+            print(solution)
 
 
             #print(f">>>>>>> Check if solution is complete:"  )
@@ -586,7 +618,7 @@ def agent(problem_statement, other_prompts=[], memory_file=None, resume_from_mem
         
         if(correct_count >= 5):
             print(">>>>>>> Correct solution found.")
-            print(json.dumps(solution, indent=4))
+            print(solution)
             return solution
 
         elif(error_count >= 10):
@@ -614,12 +646,63 @@ if __name__ == "__main__":
     parser.add_argument('--memory', '-mem', type=str, help='Path to memory file for saving/loading state (optional)')
     parser.add_argument('--resume', '-r', action='store_true', help='Resume from memory file if provided')
     
+    # New arguments
+    parser.add_argument('--api_key', type=str, help='Google API Key')
+    parser.add_argument('--model', type=str, default=DEFAULT_MODEL_NAME, help='Model name')
+    parser.add_argument('--endpoint', type=str, default=DEFAULT_ENDPOINT, help='API Endpoint')
+
     args = parser.parse_args()
 
     max_runs = args.max_runs
     memory_file = args.memory
     resume_from_memory = args.resume
     
+    MODEL_NAME = args.model
+    api_key = args.api_key or os.getenv("GOOGLE_API_KEY")
+    endpoint = args.endpoint
+
+    if not api_key:
+        print("Error: GOOGLE_API_KEY environment variable not set and --api_key not provided.")
+        sys.exit(1)
+
+    # Initialize Client
+    print(f"Initializing Client with endpoint: {endpoint}, model: {MODEL_NAME}")
+
+    # Handle custom endpoint logic
+    # If the user provides a custom endpoint like https://ai.mapleisle.cn/v1beta,
+    # we want to use it as base_url, but we need to ensure api_version is handled correctly.
+    # The SDK seems to append /models/... so if the base_url is .../v1beta, we should likely set api_version=None
+    # BUT, our previous test showed api_version=None with .../v1beta caused 404.
+    # While api_version='v1beta' with ... (no version) worked.
+    # So we will try to detect if version is in endpoint.
+
+    http_options_kwargs = {}
+
+    if "googleapis.com" not in endpoint:
+        # Custom endpoint logic
+        if endpoint.endswith("/v1beta"):
+            # If user explicitly put v1beta at end, we might need to strip it and use api_version='v1beta'
+            # OR assume the user knows what they are doing.
+            # Based on my test: base_url="https://ai.mapleisle.cn" + api_version="v1beta" WORKED.
+            # So if input is "https://ai.mapleisle.cn/v1beta", let's strip /v1beta and set version.
+            endpoint_base = endpoint.replace("/v1beta", "")
+            http_options_kwargs = {
+                "base_url": endpoint_base,
+                "api_version": "v1beta"
+            }
+        else:
+             http_options_kwargs = {
+                "base_url": endpoint,
+                "api_version": "v1beta" # Default to v1beta if not specified in URL?
+            }
+
+    # If no custom endpoint, defaults apply (None), or if user passed standard google endpoint.
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(**http_options_kwargs) if http_options_kwargs else None
+    )
+
     other_prompts = []
     if args.other_prompts:
         other_prompts = args.other_prompts.split(',')
@@ -646,10 +729,12 @@ if __name__ == "__main__":
             sol = agent(problem_statement, other_prompts, memory_file, resume_from_memory)
             if(sol is not None):
                 print(f">>>>>>> Found a correct solution in run {i}.")
-                print(json.dumps(sol, indent=4))
+                print(sol)
                 break
         except Exception as e:
             print(f">>>>>>> Error in run {i}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     # Close log file if it was opened
